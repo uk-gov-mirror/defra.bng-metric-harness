@@ -1,128 +1,85 @@
 # CDP performance testing
 
 How to write JMeter performance tests for the BNG Metric service that run
-unmodified on the **Core Delivery Platform (CDP)**. It uses the baseline
-geometry-validation endpoint as the worked example, but the pattern applies to
-any endpoint in the estate.
+unmodified on the **Core Delivery Platform (CDP)**. The baseline
+geometry-validation endpoint is the worked example, but the pattern applies to
+any endpoint.
 
 !!! info "Why this exists"
-    CDP mandates a specific toolchain and injects the target host, port, proxy,
-    and environment into your test at run time. A plan written the "normal"
-    JMeter way — hard-coded host, GUI listeners, a soak loop — will either fail
-    to run or waste the platform's 2-hour budget. This page captures the
-    conventions so a plan works first time.
+    CDP mandates JMeter and injects the target host, port, proxy, and
+    environment at run time. A plan written the "normal" way — hard-coded host,
+    GUI listeners, a soak loop — will fail to run or waste the 2-hour budget.
+    These conventions make a plan work first time.
 
 ## What CDP gives you, and what you write
 
-CDP performance testing is **create-a-suite-in-the-Portal**, not
-build-a-repo-by-hand. In the CDP Portal choose **Create → Performance Test
-Suite**; it scaffolds a repository from the platform template. The split of
-ownership is the single most important thing to understand:
+In the CDP Portal choose **Create → Performance Test Suite**; it scaffolds a repo
+from the platform template. You own **one file** — the `.jmx` — plus its test
+data. Don't reinvent the runner, reporting, or Docker packaging.
 
 | CDP owns (the scaffold) | You own (the payload) |
 | --- | --- |
-| The JMeter runner + Docker image | The **`.jmx` test plan** |
+| JMeter runner + Docker image | The **`.jmx` test plan** |
 | `entrypoint.sh` (invokes JMeter, injects properties, wires the proxy) | Test data (fixtures, a `CSV` of ids) |
-| Report generation and publishing (HTML dashboard, and/or Allure) | Any `setUp`/staging logic inside the plan |
-| Triggering runs (on demand or scheduled) from the Portal | Assertions / thresholds that define pass/fail |
+| Report generation + publishing (HTML dashboard, and/or Allure) | Any `setUp`/staging logic inside the plan |
+| Triggering runs from the Portal | Assertions / thresholds that define pass/fail |
 
-You are writing **one file** — the `.jmx` — plus its test data. Everything else
-is the platform's. Do not reinvent the runner, the reporting, or the Docker
-packaging.
+**Platform facts that shape the plan** (from the CDP *Performance Testing FAQ*
+and the template's `entrypoint.sh`):
 
-### The platform facts that shape the plan
+- **JMeter only** — the DEFRA-approved tool. Results publish back as an HTML
+  dashboard (some scaffolds add Allure — check yours).
+- **Target is injected as separate properties**, never a URL: `-Jprotocol`,
+  `-Jdomain`, `-Jport`, `-Jenv`. Read these; don't hard-code a host.
+- **Egress is via a proxy** at `localhost:3128`, set on the JVM by the entrypoint.
+  Don't configure the proxy in the `.jmx`.
+- **Don't call external services** — rate limits, WAFs, and anti-bot measures
+  block automated suites. Test only your own service.
+- **2-hour hard cap; soak is discouraged.** Design for targeted load, stress, and
+  spike tests, not endurance.
 
-These come from the CDP *Performance Testing FAQ* and the template's
-`entrypoint.sh`:
-
-- **JMeter is the DEFRA-approved tool.** Results are published back to the Portal
-  as an HTML dashboard (some scaffolds also add Allure — check which yours emits).
-  No other load tool is supported.
-- **The target service is injected as separate properties**, never as a URL:
-  `-Jprotocol`, `-Jdomain`, `-Jport`, plus `-Jenv` for the environment name.
-  Your plan must read these, not hard-code a host.
-- **Outbound egress is via a proxy** at `localhost:3128`, set on the JVM by the
-  entrypoint (`-Dhttp.proxyHost` / `-Dhttps.proxyHost`). You do **not** configure
-  the proxy in the `.jmx`.
-- **Avoid calling external services.** They have rate limits, WAFs, and anti-bot
-  measures that will block an automated suite. Test only your own service.
-- **There is a 2-hour hard cap, and soak tests are discouraged.** CDP steers you
-  to *targeted load, stress, and spike* tests that produce actionable findings
-  quickly. Design for peak-condition validation, not endurance.
-- **Tenant teams run their own tests** from the Portal, on demand or on a
-  schedule of their choosing.
-
-### How a run actually happens
-
-The suite behaves like any other CDP service:
-
-1. You merge a change to `main` in the test-suite repo.
-2. A GitHub Actions **Publish** workflow builds a **versioned Docker image** and
-   pushes it to CDP.
-3. From the Portal you launch that image; CDP runs it as an ECS task and provides
-   the infrastructure.
-4. The container runs your plan and publishes the report to the Portal.
-
-So "editing a test" means merging to `main`, not uploading a file in the Portal.
-There is no local setup for the CDP path — but you can run the same plan locally
-first (see [Dry-run locally](#dry-run-locally-before-pushing)).
+**How a run happens:** merge to `main` → a GitHub Actions **Publish** workflow
+builds a versioned Docker image and pushes it to CDP → you launch that image from
+the Portal, which runs it as an ECS task and publishes the report. "Editing a
+test" means merging to `main`, not uploading in the Portal. You can still run the
+plan locally first (see [Dry-run locally](#dry-run-locally-before-pushing)).
 
 ## Writing the `.jmx` to CDP's contract
 
 Six rules turn an ordinary JMeter plan into a CDP-compatible one.
 
-### 1. Read the target from CDP's properties
-
-Put a single **HTTP Request Defaults** element at the top of the plan and feed it
-from CDP's injected properties, with local fallbacks so the same file runs on a
-developer machine:
+**1. Read the target from CDP's properties.** One **HTTP Request Defaults**
+element at the top, fed from the injected properties with local fallbacks so the
+same file runs on a dev machine:
 
 ```xml
 <ConfigTestElement guiclass="HttpDefaultsGui" testclass="ConfigTestElement" testname="HTTP Request Defaults (backend)">
   <stringProp name="HTTPSampler.protocol">${__P(protocol,http)}</stringProp>
   <stringProp name="HTTPSampler.domain">${__P(domain,localhost)}</stringProp>
   <stringProp name="HTTPSampler.port">${__P(port,3001)}</stringProp>
-  ...
 </ConfigTestElement>
 ```
 
 Every sampler then carries **only the path** (`/baseline/validate/${UPLOAD_ID}`),
-inheriting protocol/domain/port. This is what lets CDP point the plan at any
-environment without you touching the file.
+inheriting protocol/domain/port — so CDP can point the plan at any environment.
 
-### 2. Don't touch the proxy
+**2. Don't touch the proxy.** The entrypoint already sets it; adding proxy config
+in the plan doubles up and breaks in-platform calls.
 
-The entrypoint already sets `-Dhttp(s).proxyHost=localhost -Dhttp(s).proxyPort=3128`.
-Adding proxy config in the plan will double up and break in-platform calls. Leave
-it out.
+**3. No GUI listeners.** Remove *View Results Tree*, *Summary Report*, etc. CDP
+captures the `.jtl` (`-e -l "${REPORTFILE}"`) and builds the report itself.
 
-### 3. No GUI listeners
+**4. Name samplers and assertions clearly.** The report groups by name, so give
+each a human name (`POST /baseline/validate (size ${PARCELS})`). Wrap any
+multi-request journey (upload → poll → validate) in a **Transaction Controller**
+to report it as one end-to-end number.
 
-Remove *View Results Tree*, *Summary Report*, *Aggregate Report*, etc. CDP
-captures the `.jtl` and builds the report itself; listeners only bloat the run
-and the container. The entrypoint invokes JMeter with `-e -l "${REPORTFILE}"`
-already.
+**5. Make pass/fail explicit.** A load test with no assertions is just traffic.
+Add a **Response Assertion** for status, and a **Duration Assertion** where you
+have an SLO.
 
-### 4. Name samplers and assertions clearly
-
-The report groups results by sampler and transaction name and shows assertion
-results as steps. Give each sampler a human name (`POST /baseline/validate (size
-${PARCELS})`) and each assertion a descriptive `testname`. Readable names here
-become a readable report. Wrap any multi-request journey (e.g. upload → poll →
-validate) in a **Transaction Controller** so it reports as one end-to-end number
-plus a per-request breakdown.
-
-### 5. Make pass/fail explicit with assertions
-
-A load test with no assertions is just traffic. Add a **Response Assertion** for
-the expected status and, where you have an SLO, a **Duration Assertion**. These
-become the red/green in the report and the signal for a scheduled run.
-
-### 6. Use the standard load-control variables
-
-CDP shapes the load through a standard set of variables, set from the Portal (and
-passed to the container locally). Read these in the plan rather than inventing
-your own names, so the Portal's knobs work without edits:
+**6. Use the standard load-control variables**, set from the Portal, so its knobs
+work without edits:
 
 | Variable | Meaning |
 | --- | --- |
@@ -133,17 +90,14 @@ your own names, so the Portal's knobs work without edits:
 | `TEST_SCENARIO` | Which scenario file under `scenarios/` to run |
 
 !!! note "Confirm the exact bridge in your scaffold"
-    Treat these as the convention to align to, not gospel — check how your
-    generated `entrypoint.sh` maps them to JMeter (`-J` property vs. environment
-    variable) and match it. Any other knobs (SLO thresholds, ids) should still be
-    `-J` properties with sensible defaults.
+    Check how your generated `entrypoint.sh` maps these to JMeter (`-J` property
+    vs. environment variable) and match it. Other knobs (SLO thresholds, ids)
+    should be `-J` properties with sensible defaults.
 
-### Auth: inject the token, never commit it
-
-The BNG backend authenticates every request with a **bearer JWT** (the
-`defra-jwt` Hapi strategy, verified against a JWKS). Your samplers need an
-`Authorization: Bearer ${TOKEN}` header (set once in an **HTTP Header Manager**),
-but the token must **never** be committed.
+**Auth: inject the token, never commit it.** The backend authenticates every
+request with a **bearer JWT** (the `defra-jwt` Hapi strategy, verified against a
+JWKS). Add an `Authorization: Bearer ${TOKEN}` header (once, in an **HTTP Header
+Manager**) with the token read from a property:
 
 ```xml
 <elementProp name="TOKEN" elementType="Argument">
@@ -152,81 +106,64 @@ but the token must **never** be committed.
 </elementProp>
 ```
 
-Supply it at run time — either `-Jtoken="$TOKEN"` from `entrypoint.sh` sourcing a
-**CDP secret** exposed as an environment variable, or minted by a login step
-inside the plan. Confirm the mechanism your scaffold supports; secret handling is
-the one detail that varies by suite.
+Supply it at run time — `-Jtoken="$TOKEN"` from `entrypoint.sh` sourcing a **CDP
+secret**, or minted by a login step in the plan. Confirm the mechanism your
+scaffold supports.
 
 ## Designing tests that fit the 2-hour budget
 
-Because soak is discouraged, split the work into short, focused thread groups.
-For the validation endpoint, three cover the ground:
+Split the work into short, focused thread groups. Three cover the validation
+endpoint:
 
 | Thread group | Shape | What it answers |
 | --- | --- | --- |
-| **A — size sweep** | 1 thread, iterate a CSV of `(uploadId, parcels)` | How per-request latency scales with **input size** (parcel count). A benchmark, not a load test. |
-| **B — concurrency ramp** | N threads ramping against the largest file, short duration | **Load / stress**: where p95/p99 knees up as concurrent uploads contend for the connection pool and CPU. |
-| **C — lock contention** | Concurrent full-pipeline requests against **one** project | That the write path degrades **gracefully** (clean `409`s, not `5xx` or hung connections). |
+| **A — size sweep** | 1 thread, iterate a CSV of `(uploadId, parcels)` | How latency scales with **input size** (parcel count). A benchmark, not a load test. |
+| **B — concurrency ramp** | N threads ramping against the largest file, short duration | **Load / stress**: where p95/p99 knees up as uploads contend for the pool and CPU. |
+| **C — lock contention** | Concurrent full-pipeline requests against **one** project | That the write path degrades **gracefully** (clean `409`s, not `5xx` or hangs). |
 
 !!! tip "Size vs. concurrency are different questions"
-    Heavy geometry work scales with the **number of parcels in one file**, not
-    with the number of users. Group A isolates that (single-threaded, varying
-    file size); Groups B and C isolate concurrency (fixed file, varying load).
-    Keep them separate — a single mixed run answers neither cleanly.
+    Geometry work scales with the **parcels in one file**, not the number of
+    users. Group A isolates size (single-threaded, varying file); B and C isolate
+    concurrency (fixed file, varying load). A single mixed run answers neither
+    cleanly.
 
 Enable only Group A by default; turn B and C on for dedicated load runs. Keep
-every duration well under the 2-hour cap — a few minutes at realistic peak beats
-an hour of steady state.
-
-For a more realistic picture, you can also add a **mixed scenario** that runs
-several journeys as parallel thread groups at once, rather than one journey in
-isolation. Use the isolated groups above to find bottlenecks,
-and a mixed run to check the service copes under a realistic traffic blend.
+every duration well under the cap. For a realistic picture, add a **mixed
+scenario** running several journeys as parallel thread groups at once — use the
+isolated groups to find bottlenecks, the mixed run to check the service copes
+under a traffic blend.
 
 !!! tip "Say what the numbers mean, and compare to a target"
-    These thread groups are **closed-loop with no think time** — they push as hard
-    as the service will allow, so they measure how many **simultaneous users** stay
-    responsive, *not* the real-world arrival rate. State that when you report
-    results, and compare them to a **capacity target** (find or agree the BNG
-    equivalent of an NFR figure, e.g. "N uploads/hour"). A pass/fail against a
-    target is far more useful than a bare latency number. Also watch **error rate**
-    as a headline KPI, and remember JMeter's throughput column is **per second** —
-    multiply by 60 for per-minute, 3,600 for per-hour.
+    These groups are **closed-loop with no think time** — they measure how many
+    **simultaneous users** stay responsive, *not* the real-world arrival rate.
+    State that, and compare to a **capacity target** (the BNG equivalent of an NFR
+    figure, e.g. "N uploads/hour"). Watch **error rate** as a headline KPI, and
+    remember JMeter throughput is **per second** — ×60 for per-minute, ×3,600 for
+    per-hour.
 
 ## The BNG service specifics
 
-Two things about this service determine how the plan is built.
+**The endpoint takes an `uploadId`, not the file.**
+`POST /baseline/validate/{uploadId}` (and `/post-intervention/validate/{uploadId}`)
+does **not** receive the GeoPackage in the body — the **CDP Uploader** already
+pushed it to S3. The handler polls the uploader's `/status/{uploadId}` for the
+bucket/key, then downloads and validates. The body is just an optional
+`{ "projectId": "<uuid>" }`. So:
 
-### The endpoint takes an `uploadId`, not the file
+- **Pre-stage uploads** — each fixture goes through *upload → ready* once to get an
+  `uploadId`.
+- **Validation with no `projectId` is read-only, idempotent, and replayable** —
+  stage once, drive many iterations. Add a `projectId` only to exercise the write
+  path.
 
-`POST /baseline/validate/{uploadId}` (and the sibling
-`/post-intervention/validate/{uploadId}`) does **not** receive the GeoPackage in
-the request body. The file was already pushed to S3 by the **CDP Uploader**; the
-handler resolves it by polling the uploader's `/status/{uploadId}` for the S3
-bucket/key, then downloads and validates it. The request body is just an optional
-`{ "projectId": "<uuid>" }`.
-
-Two consequences:
-
-- **You must pre-stage uploads.** Each fixture has to go through *upload → ready*
-  once to obtain an `uploadId` the plan can hit.
-- **Validation with no `projectId` is read-only and idempotent.** It downloads
-  from S3 and runs the geometry checks without writing anything, so a staged
-  `uploadId` is **replayable** — stage once, drive many iterations. Include a
-  `projectId` only when you deliberately want to exercise the write path.
-
-### `projectId` turns on sizing, persistence, and a row lock
-
-When a `projectId` is present the request additionally calculates habitat sizes,
-extracts the document, and **persists** it — taking a `FOR UPDATE` row lock with
-a `lock_timeout`. Concurrent requests for the **same** project are designed to
-return `409`, which is exactly what Group C asserts. Use **distinct** project ids
-to load-test the happy write path, or a **shared** id to prove the contention
-behaviour.
+**`projectId` turns on sizing, persistence, and a row lock.** With a `projectId`
+present, the request also calculates habitat sizes, extracts the document, and
+**persists** it — taking a `FOR UPDATE` row lock with a `lock_timeout`. Concurrent
+requests for the **same** project return `409` (what Group C asserts). Use
+**distinct** ids to load-test the happy write path, a **shared** id to prove the
+contention behaviour.
 
 ## Staging test data
-
-### Generate fixtures of varying size
 
 The shared library produces synthetic GeoPackages with a controllable parcel
 count:
@@ -240,18 +177,13 @@ for (const numParcels of [100, 500, 1000, 2000]) {
 }
 ```
 
-### Turn fixtures into `uploadId`s
+Turn fixtures into `uploadId`s, in order of robustness:
 
-Two options, in order of robustness:
-
-1. **A `setUp` Thread Group inside the plan** (preferred for deployed
-   environments). It calls the CDP Uploader — *initiate → PUT the fixture → poll
-   `/status/{uploadId}` until `ready`* — and captures each returned `uploadId`
-   into a JMeter variable/property for the main thread groups. This makes the
-   suite self-staging and safe to schedule unattended.
+1. **A `setUp` Thread Group inside the plan** (preferred). Calls the CDP Uploader
+   — *initiate → PUT the fixture → poll `/status/{uploadId}` until `ready`* — and
+   captures each `uploadId` into a property. Self-staging and safe to schedule.
 2. **A hand-built `uploads.csv`** of `uploadId,parcels` staged out of band. Fine
-   for a one-off local run; brittle against a fresh environment where those ids
-   don't exist.
+   for a one-off local run; brittle against a fresh environment.
 
 ```csv
 uploadId,parcels
@@ -260,13 +192,13 @@ uploadId,parcels
 ```
 
 !!! warning "ids are environment-specific"
-    An `uploadId` only resolves in the environment where it was staged. Don't
-    carry a CSV from local into a CDP run — stage in-environment (option 1).
+    An `uploadId` only resolves where it was staged. Don't carry a CSV from local
+    into a CDP run — stage in-environment (option 1).
 
 ## Dry-run locally before pushing
 
 The property defaults let you exercise the plan against a locally running backend
-(`npm run dev` in the harness, backend on `:3001`) before it ever reaches CDP:
+(`npm run dev` in the harness, backend on `:3001`) before it reaches CDP:
 
 ```sh
 jmeter -n -t scenarios/test.jmx \
@@ -276,13 +208,10 @@ jmeter -n -t scenarios/test.jmx \
   -l results.jtl -e -o ./html-report
 ```
 
-A green local run with a stub token confirms the plan's structure, headers, and
-assertions before you spend a CDP slot.
-
-For higher fidelity, run it against the **full local stack** (the backend's
-`compose.yml` brings up PostGIS, Redis, LocalStack, and the CDP uploader stub),
-so the upload → validate path exercises real infrastructure — the closest mirror
-of a CDP run before you push.
+A green run with a stub token confirms structure, headers, and assertions before
+you spend a CDP slot. For higher fidelity, run against the **full local stack**
+(the backend's `compose.yml` brings up PostGIS, Redis, LocalStack, and the CDP
+uploader stub) — the closest mirror of a CDP run.
 
 ## Checklist
 
@@ -291,29 +220,27 @@ Before committing a plan to a CDP performance test suite:
 - [ ] Target read from `${__P(protocol)}` / `${__P(domain)}` / `${__P(port)}` via
       **HTTP Request Defaults** — no hard-coded host.
 - [ ] Samplers carry **paths only**.
-- [ ] **No** proxy configuration in the plan.
-- [ ] **No** GUI listeners.
+- [ ] **No** proxy configuration, **no** GUI listeners in the plan.
 - [ ] `Authorization: Bearer ${__P(token)}` header; **no token committed**.
-- [ ] Samplers and assertions have descriptive names; multi-request journeys are
-      wrapped in a **Transaction Controller**.
-- [ ] Every request has a **Response Assertion**; SLO'd requests have a
-      **Duration Assertion**.
-- [ ] Load is driven by the standard vars (`THREAD_COUNT`, `RAMPUP_SECONDS`,
+- [ ] Descriptive sampler/assertion names; multi-request journeys in a
+      **Transaction Controller**.
+- [ ] Every request has a **Response Assertion**; SLO'd requests a **Duration
+      Assertion**.
+- [ ] Load driven by the standard vars (`THREAD_COUNT`, `RAMPUP_SECONDS`,
       `LOOP_COUNT`, `DURATION_SECONDS`, `TEST_SCENARIO`); other knobs are `-J`
       properties with defaults.
-- [ ] Durations sit **well under 2 hours**; no soak loop.
-- [ ] Results are read against a **capacity target** and an **error-rate** KPI.
+- [ ] Durations **well under 2 hours**; no soak loop.
+- [ ] Results read against a **capacity target** and an **error-rate** KPI.
 - [ ] Only the service under test is called — **no external hosts**.
-- [ ] Test data is staged **in the target environment** (setUp thread group).
-- [ ] `.jmx` lives under `scenarios/`; verified with a **local dry-run** first.
+- [ ] Test data staged **in the target environment** (setUp thread group).
+- [ ] `.jmx` under `scenarios/`; verified with a **local dry-run** first.
 
 ## Reference: example test plan
 
-The following skeleton implements the three-group design above against the
-baseline validate endpoint. Place it under the scaffold's `scenarios/` directory
-(e.g. `scenarios/test.jmx`) — `TEST_SCENARIO` selects which file there runs — and
-match the scaffold's JMeter version. Confirm the exact path against your generated
-suite.
+The skeleton below implements the three-group design against the baseline validate
+endpoint. Place it under the scaffold's `scenarios/` directory (e.g.
+`scenarios/test.jmx`) — `TEST_SCENARIO` selects which file runs — and match the
+scaffold's JMeter version.
 
 ??? example "bng-baseline-validate.jmx (three-group skeleton)"
     ```xml
@@ -367,7 +294,5 @@ suite.
     </jmeterTestPlan>
     ```
 
-    The full, GUI-openable version of this plan is maintained alongside the
-    performance test suite. The comments above map one-to-one onto its thread
-    groups; build it out in the JMeter GUI to confirm structure before
-    committing.
+    The full, GUI-openable version is maintained alongside the performance test
+    suite; the comments above map one-to-one onto its thread groups.
